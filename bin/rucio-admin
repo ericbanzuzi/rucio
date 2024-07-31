@@ -14,21 +14,32 @@
 # limitations under the License.
 
 import argparse
-import datetime
 import errno
 import json
 import logging
 import math
 import os
+import pydoc
+import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
-import traceback
 from configparser import NoOptionError, NoSectionError
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from textwrap import dedent
 
-from tabulate import tabulate
+from rich import box
+from rich.console import Console
+from rich.highlighter import ReprHighlighter
+from rich.logging import RichHandler
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+from rich.traceback import install
+from rich.tree import Tree
 
 from rucio import version
 from rucio.client import Client
@@ -71,9 +82,106 @@ SUCCESS = 0
 FAILURE = 1
 DEFAULT_PORT = 443
 
-logger = logging.getLogger("user")
+# rich dependencies
+MIN_CONSOLE_WIDTH = 80  # minimum number of characters
+MAX_TRACEBACK_WIDTH = 120  # slightly higher than default width of rich.traceback (100)
+LOG_THEMES = {
+    'logging.level.info': 'default',
+    'logging.level.warning': 'bold yellow',
+    'logging.level.debug': 'dim',
+    'logging.level.critical': 'default on red',
+    'repr.bool_true': 'bright_green',
+    'repr.bool_false': 'bright_red',
+    'log.time': 'turquoise4',
+}
 
+# style mappings for highlighting keywords
+RICH_DID_TYPE = {
+    'DIDType.CONTAINER': 'green',
+    'DIDType.DATASET': 'gold1',
+    'DIDType.FILE': 'red',
+    'DIDType.COLLECTION': 'default',
+    'DIDType.ALL': 'default',
+    'DIDType.DERIVED': 'default',
+    'CONTAINER': 'green',
+    'DATASET': 'gold1',
+    'FILE': 'red',
+    'COLLECTION': 'default',
+    'ALL': 'default',
+    'DERIVED': 'default'
+}
+RICH_BOOLEAN = {
+    'True': 'bright_green',
+    'False': 'bright_red'
+}
+RICH_RULE_STATE = {
+    'OK': 'bold green',
+    'REPLICATING': 'bold orange1',
+    'STUCK': 'bold red',
+    'WAITING APPROVAL': 'bold slate_blue3',
+    'INJECT': 'bold steel_blue1',
+    'SUSPENDED': 'bold'
+}
+RICH_RSE_TYPE = {
+    'DISK': 'bold green',
+    'TAPE': 'bold red',
+    'UNKNOWN': 'bold'
+}
+RICH_SUBSCRIPTION_STATE = {
+    'ACTIVE': 'bold medium_purple3',
+    'INACTIVE': 'bold',
+    'NEW': 'bold dodger_blue1',
+    'UPDATED': 'bold green4',
+    'BROKEN': 'bold dark_red',
+    'UNKNOWN': 'bold dark_red'
+}
+RICH_AVAILABILITY = {
+    'AVAILABLE': 'bold green',
+    'DELETED': 'bold',
+    'LOST': 'bold medium_purple3',
+    'UNKNOWN': 'bold medium_purple3'
+}
+RICH_ACCOUNT_STATUS = {
+    'ACTIVE': 'bold green',
+    'SUSPENDED': 'red',
+    'DELETED': 'bold'
+}
+RICH_REPLICA_STATE = {
+    'A': 'bold green',
+    'U': 'bold red',
+    'C': 'bold orange1',
+    'B': 'bold default',
+    'D': 'bold red',
+    'T': 'bold dodger_blue1'
+}
+RICH_HIGHLIGHT_TEXT = 'yellow'
+RICH_JSON_STR = 'green'
+RICH_JSON_NUM = 'bold cyan'
+
+SUCCESS_LOGO = '\u2714'
+FAILURE_LOGO = '\u2717'
+
+# setting up rich console and exceptions
+RICH_FMT = box.SQUARE
+console = Console(theme=Theme(LOG_THEMES), soft_wrap=True)
+console.width = max(MIN_CONSOLE_WIDTH, console.width)
+install(console=console, word_wrap=True, width=min(console.width, MAX_TRACEBACK_WIDTH))
+
+logger = logging.getLogger("user")
 tablefmt = 'psql'
+
+
+def setup_pager():
+    less_path = shutil.which('less')
+    try:
+        result = subprocess.run([less_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        less_available = result.returncode == 0
+    except FileNotFoundError:
+        less_available = False
+
+    if console.is_terminal and hasattr(os, 'system') and less_available:
+        pydoc.getpager = lambda: lambda text: pydoc.pipepager(text, 'less -FXSR')
+    return
 
 
 def setup_logger(logger):
@@ -90,7 +198,69 @@ def setup_logger(logger):
     logger.addHandler(hdlr)
 
 
-setup_logger(logger)
+def setup_rich_logger(module_name, logger_name, logger_level=logging.NOTSET, verbose=False, console=None):
+    '''
+    Factory method to set logger with handlers.
+    :param module_name: __name__ of the module that is calling this method
+    :param logger_name: name of the logger, typically name of the module.
+    :param logger_level: if not given, fetched from config.
+    :param verbose: verbose option set in bin/rucio
+    '''
+
+    # helper method for cfg check
+    def _force_cfg_log_level(cfg_option: str):
+        cfg_forced_modules = config_get('logging', cfg_option, raise_exception=False, default=None, clean_cached=True,
+                                        check_config_table=False)
+        if cfg_forced_modules and module_name is not None:
+            if re.match(str(cfg_forced_modules), module_name):
+                return True
+        return False
+
+    # creating log
+    if not logger_name:
+        if not module_name:
+            logger_name = 'usr'
+        else:
+            logger_name = module_name.split('.')[-1]
+    logger = logging.getLogger(logger_name)
+
+    # extracting the log level
+    if not logger_level:
+        logger_level = logging.INFO
+        if verbose:
+            logger_level = logging.DEBUG
+
+        # overriding by the config
+        cfg_levels = (logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR)
+        for level in cfg_levels:
+            cfg_opt = 'forceloglevel' + logging.getLevelName(level)
+            if _force_cfg_log_level(cfg_opt):
+                logger_level = level
+
+    # setting the log level
+    logger.setLevel(logger_level)
+
+    # preferred logger handling
+    def add_handler(logger, console=None, verbose=False):
+        def time_formatter(timestamp: datetime) -> Text:
+            formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            milliseconds = timestamp.microsecond // 1000
+            return Text(f"[{formatted_time},{milliseconds:03d}]")
+
+        highlighter = ReprHighlighter()
+        handler = RichHandler(rich_tracebacks=True, markup=True, show_path=verbose, show_time=verbose,
+                              console=console, tracebacks_width=min(console.width, MAX_TRACEBACK_WIDTH), tracebacks_word_wrap=True,
+                              log_time_format=time_formatter, highlighter=highlighter)
+        logger.addHandler(handler)
+
+    # setting handler and formatter
+    if not logger.handlers:
+        add_handler(logger, console, verbose)
+
+    return logger
+
+
+setup_pager()
 
 
 def signal_handler(signal, frame):
@@ -99,6 +269,33 @@ def signal_handler(signal, frame):
 
 
 signal.signal(signal.SIGINT, signal_handler)
+
+
+def generate_table(table_format, headers, rows, col_alignments=None, show_header=True, row_styles=None):
+    table = Table(box=table_format, show_header=show_header)
+    rich_widgets = (Text, Tree, Table)
+    if row_styles is None:
+        row_styles = ['none', 'dim']
+    table.row_styles = row_styles
+
+    if not col_alignments and len(rows) > 0:
+        # auto-detect on first row, numerical values on the right
+        col_alignments = ['right' if str(value).isnumeric() else 'left' for value in rows[0]]
+    elif col_alignments and len(rows) > len(col_alignments):
+        while len(rows) > len(col_alignments):
+            col_alignments.append('left')
+
+    for i, header in enumerate(headers):
+        if col_alignments:
+            justify = col_alignments[i] if col_alignments[i] in ["left", "center", "right"] else "left"
+            table.add_column(header, overflow='fold', justify=justify)
+        else:
+            table.add_column(header, overflow='fold')
+
+    for row in rows:
+        row = [elem if isinstance(elem, rich_widgets) and str(elem) != 'None' else str(elem) if elem is not None and str(elem) != 'None' else '' for elem in row]
+        table.add_row(*row)
+    return table
 
 
 def exception_handler(function):
@@ -183,9 +380,11 @@ def exception_handler(function):
                 devnull = os.open(os.devnull, os.O_WRONLY)
                 os.dup2(devnull, sys.stdout.fileno())
                 return SUCCESS
-            logger.error(error)
+            if logger.level == logging.DEBUG:
+                logger.exception(error)
+            else:
+                logger.error(error)
             logger.error('Rucio exited with an unexpected/unknown error, please provide the traceback below to the developers.')
-            logger.debug(traceback.format_exc())
             return FAILURE
     return new_funct
 
@@ -258,7 +457,7 @@ def add_account(args):
     """
     client = get_client(args)
     client.add_account(account=args.account, type_=args.accounttype, email=args.accountemail)
-    print('Added new account: %s' % args.account)
+    console.print('Added new account \'%s\' with type %s' % (args.account, args.accounttype))
     return SUCCESS
 
 
@@ -272,7 +471,7 @@ def delete_account(args):
     """
     client = get_client(args)
     client.delete_account(args.acnt)
-    print('Deleted account: %s' % args.acnt)
+    print('Deleted account %s' % args.acnt)
     return SUCCESS
 
 
@@ -286,7 +485,7 @@ def update_account(args):
     """
     client = get_client(args)
     client.update_account(account=args.account, key=args.key, value=args.value)
-    print('%s of account %s changed to %s' % (args.key, args.account, args.value))
+    console.print(f'Updated account {args.account}: {args.key}={args.value}')
     return SUCCESS
 
 
@@ -300,7 +499,7 @@ def ban_account(args):
     """
     client = get_client(args)
     client.update_account(account=args.account, key='status', value='SUSPENDED')
-    print('Account %s banned' % args.account)
+    print('Banned account %s' % args.account)
     return SUCCESS
 
 
@@ -314,7 +513,7 @@ def unban_account(args):
     """
     client = get_client(args)
     client.update_account(account=args.account, key='status', value='ACTIVE')
-    print('Account %s unbanned' % args.account)
+    print('Unbanned account %s' % args.account)
     return SUCCESS
 
 
@@ -332,8 +531,15 @@ def list_accounts(args):
         for key, value in [(_.split('=')[0], _.split('=')[1]) for _ in args.filters.split(',')]:
             filters[key] = value
     accounts = client.list_accounts(identity=args.identity, account_type=args.account_type, filters=filters)
+    table_data = []
     for account in accounts:
-        print(account['account'])
+        table_data.append([account['account'], account['type'], account['email']])
+    table = generate_table(RICH_FMT, headers=['ACCOUNT', 'TYPE', 'EMAIL'], rows=table_data)
+    if console.is_terminal:
+        console.print(table)
+    else:
+        console.width = sys.maxsize
+        console.print(table)
     return SUCCESS
 
 
@@ -347,8 +553,16 @@ def info_account(args):
     """
     client = get_client(args)
     info = client.get_account(account=args.account)
-    for k in info:
-        print(k.ljust(10) + ' : ' + str(info[k]))
+    keyword_styles = {}
+    if console.is_terminal:
+        keyword_styles = RICH_ACCOUNT_STATUS
+    table_data = [(k, Text(str(v), style=keyword_styles.get(str(v), 'default'))) for k, v in sorted(info.items())]
+    table = generate_table(RICH_FMT, headers=['', ''], rows=table_data, show_header=False, row_styles=['none'])
+    if console.is_terminal:
+        console.print(table)
+    else:
+        console.width = sys.maxsize
+        console.print(table)
     return SUCCESS
 
 
@@ -361,8 +575,15 @@ def list_identities(args):
     """
     client = get_client(args)
     identities = client.list_identities(account=args.account)
+    table_data = []
     for identity in identities:
-        print('Identity: %(identity)s,\ttype: %(type)s' % identity)
+        table_data.append([identity['identity'], identity['type']])
+    table = generate_table(RICH_FMT, headers=['IDENTITY', 'TYPE'], rows=table_data)
+    if console.is_terminal:
+        console.print(table)
+    else:
+        console.width = sys.maxsize
+        console.print(table)
     return SUCCESS
 
 
@@ -390,7 +611,7 @@ def set_limits(args):
                 return FAILURE
 
     client.set_account_limit(account=args.account, rse=args.rse, bytes_=byte_limit, locality=locality)
-    print('Set account limit for account %s on RSE %s: %s' % (args.account, args.rse, sizefmt(byte_limit, True)))
+    console.print('Set account limit for account %s on RSE %s: %s' % (args.account, args.rse, sizefmt(byte_limit, True)))
     return SUCCESS
 
 
@@ -402,11 +623,12 @@ def get_limits(args):
     Grant an identity access to an account.
 
     """
+    # TODO: change this to a table?
     client = get_client(args)
     locality = args.locality.lower()
     limits = client.get_account_limits(account=args.account, rse_expression=args.rse, locality=locality)
     for rse in limits:
-        print('Quota on %s for %s : %s' % (rse, args.account, sizefmt(limits[rse], True)))
+        print('Quota on %s for %s: %s' % (rse, args.account, sizefmt(limits[rse], True)))
     return SUCCESS
 
 
@@ -441,7 +663,7 @@ def identity_add(args):
         return FAILURE
 
     client.add_identity(account=args.account, identity=args.identity, authtype=args.authtype, email=args.email, password=args.password)
-    print('Added new identity to account: %s-%s' % (args.identity, args.account))
+    print('Added new identity to account %s: %s' % (args.account, args.identity))
     return SUCCESS
 
 
@@ -455,7 +677,7 @@ def identity_delete(args):
     """
     client = get_client(args)
     client.del_identity(args.account, args.identity, authtype=args.authtype)
-    print('Deleted identity: %s' % args.identity)
+    print('Deleted identity from account %s: %s' % (args.account, args.identity))
     return SUCCESS
 
 
@@ -469,7 +691,7 @@ def add_rse(args):
     """
     client = get_client(args)
     client.add_rse(args.rse, deterministic=not args.non_deterministic)
-    print('Added new %sdeterministic RSE: %s' % ('non-' if args.non_deterministic else '', args.rse))
+    console.print('Added new %sdeterministic RSE: [green]%s[/]' % ('non-' if args.non_deterministic else '', args.rse), highlight=False)
     return SUCCESS
 
 
@@ -483,6 +705,7 @@ def disable_rse(args):
     """
     client = get_client(args)
     client.delete_rse(args.rse)
+    print(f'Deleted RSE {args.rse}')
     return SUCCESS
 
 
@@ -496,8 +719,11 @@ def list_rses(args):
     """
     client = get_client(args)
     rses = client.list_rses()
-    for rse in rses:
-        print('%(rse)s' % rse)
+    rses = [[rse['rse']] for rse in sorted(rses, key=lambda elem: elem['rse'])]
+    table = generate_table(RICH_FMT, headers=['RSE'], rows=rses)
+    if not console.is_terminal:
+        console.width = sys.maxsize
+    console.print(table)
     return SUCCESS
 
 
@@ -540,37 +766,92 @@ def info_rse(args):
     client = get_client(args)
     rseinfo = client.get_rse(rse=args.rse)
     attributes = client.list_rse_attributes(rse=args.rse)
-    usage = client.get_rse_usage(rse=args.rse)
+    usage = client.get_rse_usage(rse=args.rse, filters={'per_account': None})
     rse_limits = client.get_rse_limits(args.rse)
-    print('Settings:')
-    print('=========')
-    for key in sorted(rseinfo):
+    keyword_styles = {}
+    if console.is_terminal:
+        keyword_styles = dict(RICH_BOOLEAN)
+        keyword_styles.update(RICH_RSE_TYPE)
+
+    table_data = []
+    for i, key in enumerate(sorted(rseinfo)):
+        if i == 0:
+            console.print('[b]Settings:[/]')
         if key != 'protocols':
-            print('  ' + key + ': ' + str(rseinfo[key]))
-    print('Attributes:')
-    print('===========')
-    for attribute in sorted(attributes):
-        print('  ' + attribute + ': ' + str(attributes[attribute]))
-    print('Protocols:')
-    print('==========')
-    for protocol in sorted(rseinfo['protocols'], key=lambda x: x['scheme']):
-        print('  ' + protocol['scheme'])
+            if not isinstance(rseinfo[key], list):
+                table_data.append((key, Text(str(rseinfo[key]), style=keyword_styles.get(str(rseinfo[key]), 'default'))))
+            else:
+                table_data.append((key, rseinfo[key]))
+
+    table = generate_table(RICH_FMT, headers=['', ''], rows=table_data, show_header=False, row_styles=['none'], col_alignments=['left', 'left'])
+    if not console.is_terminal:
+        console.width = sys.maxsize
+    console.print(table)
+
+    table_data = []
+    for i, attribute in enumerate(sorted(attributes)):
+        if i == 0:
+            console.print('\n[b]Attributes:[/]')
+        table_data.append((attribute, Text(str(attributes[attribute]), style=keyword_styles.get(str(attributes[attribute]), 'default'))))
+    table = generate_table(RICH_FMT, headers=['', ''], rows=table_data, show_header=False, row_styles=['none'],
+                           col_alignments=['left', 'left'])
+    if not console.is_terminal:
+        console.width = sys.maxsize
+    console.print(table)
+
+    for i, protocol in enumerate(sorted(rseinfo['protocols'], key=lambda x: x['scheme'])):
+        if i == 0:
+            console.print('\n[b]Protocols:[/]')
+        console.print(Text(protocol['scheme'], style=RICH_HIGHLIGHT_TEXT))
+
+        table_data = []
         for item in sorted(protocol):
             if item == 'domains':
-                print('    ' + item + ': \'' + json.dumps(protocol[item]) + '\'')
+                tree = Tree('')
+                for domain, values in protocol[item].items():
+                    branch = tree.add(f'[{RICH_JSON_STR}]{domain}')
+                    for k, v in values.items():
+                        branch.add(f'[{RICH_JSON_STR}]{k}[/]: [{RICH_JSON_NUM}]{v}[/]')
+                table_data.append([item, tree])
             else:
-                print('    ' + item + ': ' + str(protocol[item]))
-    print('Usage:')
-    print('======')
-    for elem in sorted(usage, key=lambda x: x['source']):
-        print('  ' + elem['source'])
-        for item in sorted(elem):
-            print('    ' + item + ': ' + str(elem[item]))
-    print('RSE limits:')
-    print('===========')
-    for limit in rse_limits:
-        print('  ' + limit + ': ' + str(rse_limits[limit]) + ' B')
+                table_data.append([item, Text(str(protocol[item]), style=keyword_styles.get(protocol[item], 'default'))])
 
+        table = generate_table(RICH_FMT, headers=['', ''], rows=table_data, row_styles=['none'], show_header=False)
+        console.print(table)
+
+    header = ['SOURCE', 'USED', 'FILES', 'FREE', 'TOTAL', 'UPDATED AT']
+    key2id = {header[i].lower().replace(' ', '_'): i for i in range(len(header))}
+    table_data = []
+    for i, elem in enumerate(sorted(usage, key=lambda x: x['source'])):
+        if i == 0:
+            console.print('\n[b]Usage:[/]')
+
+        row = [''] * len(header)
+        row[0] = elem['source']
+        for item in sorted(elem):
+            if item in ['used', 'free', 'total']:
+                row[key2id[item]] = sizefmt(elem[item], True)
+            elif item != 'source' and item in key2id:
+                row[key2id[item]] = elem[item]
+        table_data.append(row)
+
+    if len(table_data) > 0:
+        usage_table = generate_table(RICH_FMT, headers=header, rows=table_data, col_alignments=['left', 'right', 'right', 'right', 'right', 'left'])
+        if not console.is_terminal:
+            console.width = sys.maxsize
+        console.print(usage_table)
+
+    table_data = []
+    for i, limit in enumerate(rse_limits):
+        if i == 0:
+            console.print('\n[b]RSE limits:[/]')
+        table_data.append((limit, str(rse_limits[limit]) + ' B'))
+
+    if len(table_data) > 0:
+        table = generate_table(RICH_FMT, headers=['', ''], rows=table_data, show_header=False, row_styles=['none'], col_alignments=['left', 'right'])
+        if not console.is_terminal:
+            console.width = sys.maxsize
+        console.print(table)
     return SUCCESS
 
 
@@ -584,7 +865,7 @@ def set_attribute_rse(args):
     """
     client = get_client(args)
     client.add_rse_attribute(rse=args.rse, key=args.key, value=args.value)
-    print('Added new RSE attribute for %s: %s-%s ' % (args.rse, args.key, args.value))
+    console.print('Added new RSE attribute for %s: %s=%s' % (args.rse, args.key, args.value))
     return SUCCESS
 
 
@@ -598,9 +879,12 @@ def get_attribute_rse(args):
     """
     client = get_client(args)
     attributes = client.list_rse_attributes(rse=args.rse)
-    for k in attributes:
-        print(k + ': ' + str(attributes[k]))
-
+    keyword_styles = dict(RICH_BOOLEAN) if console.is_terminal else {}
+    table_data = [(k, Text(str(v), style=keyword_styles.get(str(v), 'default'))) for k, v in sorted(attributes.items())]
+    table = generate_table(RICH_FMT, headers=['', ''], rows=table_data, show_header=False, row_styles=['none'])
+    if not console.is_terminal:
+        console.width = sys.maxsize
+    console.print(table)
     return SUCCESS
 
 
@@ -614,7 +898,7 @@ def delete_attribute_rse(args):
     """
     client = get_client(args)
     client.delete_rse_attribute(rse=args.rse, key=args.key)
-    print('Deleted RSE attribute for %s: %s-%s ' % (args.rse, args.key, args.value))
+    console.print('Deleted RSE attribute for %s: %s ' % (args.rse, args.key))
     return SUCCESS
 
 
@@ -628,7 +912,7 @@ def add_distance_rses(args):
     client = get_client(args)
     params = {'distance': args.distance}
     client.add_distance(args.source, args.destination, params)
-    print('Set distance from %s to %s to %d' % (args.source, args.destination, args.distance))
+    console.print('Set distance from %s to %s to: %d' % (args.source, args.destination, args.distance))
     return SUCCESS
 
 
@@ -642,7 +926,11 @@ def get_distance_rses(args):
     client = get_client(args)
     distance_info = client.get_distance(args.source, args.destination)
     if distance_info:
-        print('Distance information from %s to %s: distance=%d' % (args.source, args.destination, distance_info[0]['distance']))
+        table = generate_table(RICH_FMT, headers=['SOURCE', 'DESTINATION', 'DISTANCE'], rows=[[args.source, args.destination, str(distance_info[0]['distance'])]],
+                               col_alignments=['left', 'left', 'right'])
+        if not console.is_terminal:
+            console.width = sys.maxsize
+        console.print(table)
     else:
         print("No distance set from %s to %s" % (args.source, args.destination))
     return SUCCESS
@@ -662,9 +950,8 @@ def update_distance_rses(args):
     elif args.ranking is not None:
         params['distance'] = args.ranking
     client.update_distance(args.source, args.destination, params)
-    print('Update distance information from %s to %s:' % (args.source, args.destination))
     if params.get('distance') is not None:
-        print("- Distance set to %d" % params['distance'])
+        console.print('Updated distance information from %s to %s to: %d' % (args.source, args.destination, params['distance']))
     return SUCCESS
 
 
@@ -677,7 +964,7 @@ def delete_distance_rses(args):
     """
     client = get_client(args)
     client.delete_distance(args.source, args.destination)
-    print('Deleted distance information from %s to %s.' % (args.source, args.destination))
+    print('Deleted distance information from %s to %s' % (args.source, args.destination))
     return SUCCESS
 
 
@@ -710,6 +997,7 @@ def add_protocol_rse(args):
     if not proto['extended_attributes']:
         del proto['extended_attributes']
     client.add_protocol(args.rse, proto)
+    print(f'Added new protocol to {args.rse}')
     return SUCCESS
 
 
@@ -727,6 +1015,7 @@ def del_protocol_rse(args):
     if args.hostname:
         kwargs['hostname'] = args.hostname
     client.delete_protocols(args.rse, args.scheme, **kwargs)
+    print(f"Deleted {args.scheme} protocol for {args.rse}")
 
 
 @exception_handler
@@ -764,8 +1053,11 @@ def list_qos_policies(args):
     """
     client = get_client(args)
     qos_policies = client.list_qos_policies(args.rse)
-    for qos_policy in sorted(qos_policies):
-        print(qos_policy)
+    qos_policies = [[qos_policy] for qos_policy in sorted(qos_policies)]
+    table = generate_table(RICH_FMT, headers=['QOS POLICY'], rows=qos_policies)
+    if not console.is_terminal:
+        console.width = sys.maxsize
+    console.print(table)
     return SUCCESS
 
 
@@ -780,10 +1072,9 @@ def set_limit_rse(args):
     try:
         args.value = int(args.value)
         if client.set_rse_limits(args.rse, args.name, args.value):
-            logger.info('Set RSE limit successfully for %s: %s = %s' % (args.rse, args.name, args.value))
+            console.print('Successfully set RSE limit for %s: %s=%s' % (args.rse, args.name, args.value))
     except ValueError:
         logger.error('The RSE limit value must be an integer')
-
     return SUCCESS
 
 
@@ -800,8 +1091,7 @@ def delete_limit_rse(args):
         logger.error('Limit %s not defined in RSE %s' % (args.name, args.rse))
     else:
         if client.delete_rse_limits(args.rse, args.name):
-            logger.info('Deleted RSE limit successfully for %s: %s' % (args.rse, args.name))
-
+            print('Deleted RSE limit successfully for %s: %s' % (args.rse, args.name))
     return SUCCESS
 
 
@@ -815,7 +1105,7 @@ def add_scope(args):
     """
     client = get_client(args)
     client.add_scope(account=args.account, scope=args.scope)
-    print('Added new scope to account: %s-%s' % (args.scope, args.account))
+    console.print('Added new scope \'%s\' for account %s' % (args.scope, args.account))
     return SUCCESS
 
 
@@ -832,9 +1122,12 @@ def list_scopes(args):
         scopes = client.list_scopes_for_account(args.account)
     else:
         scopes = client.list_scopes()
-    for scope in scopes:
-        if 'mock' not in scope:
-            print(scope)
+
+    scopes = [[scope] for scope in sorted(scopes) if 'mock' not in scope]
+    table = generate_table(RICH_FMT, headers=['SCOPE'], rows=scopes)
+    if not console.is_terminal:
+        console.width = sys.maxsize
+    console.print(table)
     return SUCCESS
 
 
@@ -875,7 +1168,7 @@ def set_config_option(args):
     """
     client = get_client(args)
     client.set_config_option(section=args.section, option=args.option, value=args.value)
-    print('Set configuration: %s.%s=%s' % (args.section, args.option, args.value))
+    console.print('Set configuration: %s.%s=%s' % (args.section, args.option, args.value))
     return SUCCESS
 
 
@@ -888,9 +1181,9 @@ def delete_config_option(args):
     """
     client = get_client(args)
     if client.delete_config_option(section=args.section, option=args.option):
-        print('Deleted section \'%s\' option \'%s\'' % (args.section, args.option))
+        console.print('Deleted section \'%s\' option \'%s\'' % (args.section, args.option))
     else:
-        print('Section \'%s\' option \'%s\' not found' % (args.section, args.option))
+        console.print('Section \'%s\' option \'%s\' not found' % (args.section, args.option))
     return SUCCESS
 
 
@@ -911,7 +1204,7 @@ def add_subscription(args):
         account = client.account
     subscription_id = client.add_subscription(name=args.name, account=account, filter_=json.loads(args.filter), replication_rules=json.loads(args.replication_rules),
                                               comments=args.comments, lifetime=args.lifetime, retroactive=False, dry_run=False, priority=args.priority)
-    print('Subscription added %s' % (subscription_id))
+    print(f'Subscription {args.name} added with ID: %s' % subscription_id)
     return SUCCESS
 
 
@@ -930,13 +1223,54 @@ def list_subscriptions(args):
         account = args.issuer
     else:
         account = client.account
+
+    keyword_styles = {}
+    if console.is_terminal:
+        keyword_styles = dict(RICH_SUBSCRIPTION_STATE)
+        keyword_styles.update(RICH_BOOLEAN)
     subs = client.list_subscriptions(name=args.name, account=account)
     for sub in subs:
+        table_data = []
         if args.long:
-            print('\n'.join('%s: %s' % (str(k), str(v)) for (k, v) in list(sub.items())))
-            print()
+            for k, v in sorted(sub.items()):
+                if k == 'filter':
+                    filter_tree = Tree('')
+                    for filter, values in json.loads(sub['filter']).items():
+                        values_str = ', '.join(values)
+                        filter_tree.add(f'[green]{filter}[/]: {values}')
+                    table_data.append(('filter', filter_tree))
+                elif k == 'replication_rules':
+                    rule_tree = Tree('')
+                    for i, rule in enumerate(json.loads(sub['replication_rules'])):
+                        branch = rule_tree.add('[yellow]rule[/]')
+                        for k, v in rule.items():
+                            branch.add(f'[green]{k}[/]: {v}')
+                    table_data.append(('replication_rules', rule_tree))
+                else:
+                    table_data.append((str(k), Text(str(v), style=keyword_styles.get(str(v), 'default'))))
         else:
-            print("%s: %s %s\n  priority: %s\n  filter: %s\n  rules: %s\n  comments: %s" % (sub['account'], sub['name'], sub['state'], sub['policyid'], sub['filter'], sub['replication_rules'], sub.get('comments', '')))
+            table_data.append(('account', sub['account']))
+            table_data.append(('name', sub['name']))
+            table_data.append(('state', Text(str(sub['state']), keyword_styles.get(str(sub['state']), 'default'))))
+            table_data.append(('policyid', sub['policyid']))
+            filter_tree = Tree('')
+            for filter, values in json.loads(sub['filter']).items():
+                values_str = ', '.join(values)
+                filter_tree.add(f'[green]{filter}[/]: {values_str}')
+            table_data.append(('filter', filter_tree))
+            rule_tree = Tree('')
+            for i, rule in enumerate(json.loads(sub['replication_rules'])):
+                branch = rule_tree.add('[yellow]rule[/]')
+                for k, v in rule.items():
+                    branch.add(f'[green]{k}[/]: {v}')
+            table_data.append(('replication_rules', rule_tree))
+            table_data.append(('comments', sub.get('comments', '')))
+
+        table = generate_table(RICH_FMT, headers=['', ''], rows=table_data, show_header=False, row_styles=['none'],
+                               col_alignments=['left', 'left'])
+        if not console.is_terminal:
+            console.width = sys.maxsize
+        console.print(table)
     return SUCCESS
 
 
@@ -957,6 +1291,7 @@ def update_subscription(args):
         account = client.account
     client.update_subscription(name=args.name, account=account, filter_=json.loads(args.filter), replication_rules=json.loads(args.replication_rules),
                                comments=args.comments, lifetime=args.lifetime, retroactive=False, dry_run=False, priority=args.priority)
+    print(f"Subscription {args.name} updated")
     return SUCCESS
 
 
@@ -986,10 +1321,13 @@ def list_account_attributes(args):
     client = get_client(args)
     account = args.account or client.account
     attributes = next(client.list_account_attributes(account))
-    table = []
+    table_data = []
     for attr in attributes:
-        table.append([attr['key'], attr['value']])
-    print(tabulate(table, tablefmt=tablefmt, headers=['Key', 'Value']))
+        table_data.append([attr['key'], str(attr['value'])])
+    table = generate_table(RICH_FMT, headers=['Key', 'Value'], rows=table_data)
+    if not console.is_terminal:
+        console.width = sys.maxsize
+    console.print(table)
     return SUCCESS
 
 
@@ -1003,6 +1341,7 @@ def add_account_attribute(args):
     """
     client = get_client(args)
     client.add_account_attribute(account=args.account, key=args.key, value=args.value)
+    console.print(f"Updated account {args.account}: {args.key}={args.value}")
     return SUCCESS
 
 
@@ -1016,6 +1355,7 @@ def delete_account_attribute(args):
     """
     client = get_client(args)
     client.delete_account_attribute(account=args.account, key=args.key)
+    console.print(f"Removed attribute {args.key} from account {args.account}")
     return SUCCESS
 
 
@@ -1119,16 +1459,17 @@ def declare_bad_file_replicas(args):
     if args.verbose:
         print("PFNs that will be declared bad:")
         for pfn in bad_files_pfns:
-            print(pfn)
+            print('   ' + pfn)
 
     if len(bad_files_pfns) < 100:
         # Using the old API to declare
         non_declared = client.declare_bad_file_replicas(bad_files_pfns, args.reason)
         for rse in non_declared:
             for pfn in non_declared[rse]:
-                print('%s : PFN %s cannot be declared.' % (rse, pfn))
+                print('%s: PFN %s cannot be declared.' % (rse, pfn))
     else:
-        print('Getting the information about RSE protocols. It can take several seconds')
+        # TODO: add spinner
+        print('Getting the information about RSE protocols. It can take several seconds.')
         dict_rse = client.export_data(distance=False)
         prot_dict = {}
         for rse, dict_attr in dict_rse['rses'].items():
@@ -1174,6 +1515,7 @@ def declare_bad_file_replicas(args):
     return SUCCESS
 
 
+# TODO: check how to change this
 @exception_handler
 def declare_temporary_unavailable_replicas(args):
     """
@@ -1197,7 +1539,7 @@ def declare_temporary_unavailable_replicas(args):
         bad_files = args.listbadfiles
 
     assert args.duration is not None, "Duration should have been set, something went wrong!"
-    expiration_date = (datetime.datetime.utcnow() + datetime.timedelta(seconds=args.duration)).isoformat()
+    expiration_date = (datetime.now(timezone.utc) + timedelta(seconds=args.duration)).isoformat()
 
     chunk_size = 10000
     tot_files = len(bad_files)
@@ -1261,7 +1603,7 @@ def list_pfns(args):
                                            path if not path.startswith('/') else path[1:]])
                             print(pfn)
                 else:
-                    logger.error('Unexpected error')
+                    logger.error('Unexpected error.')
                     return FAILURE
             else:
                 print(result)
@@ -1279,29 +1621,30 @@ def import_data(args):
     client = get_client(args)
     import_file_path = args.file_path
     data = None
-    print('Start reading file.')
-    try:
-        with open(import_file_path) as import_file:
-            data_string = import_file.read()
-            data = parse_response(data_string)
-    except ValueError as error:
-        print('There was problem with decoding your file.')
-        print(error)
-        return FAILURE
-    except OSError as error:
-        print('There was a problem with reading your file.')
-        print(error)
-        return FAILURE
+    with console.status('Reading file...'):
+        try:
+            with open(import_file_path) as import_file:
+                data_string = import_file.read()
+                data = parse_response(data_string)
+        except ValueError as error:
+            console.print(f'[b red]{FAILURE_LOGO}[/] There was problem with decoding your file.')
+            logger.error(error)
+            return FAILURE
+        except OSError as error:
+            console.print(f'[b red]{FAILURE_LOGO}[/] There was a problem with reading your file.')
+            logger.error(error)
+            return FAILURE
 
-    if data:
-        client.import_data(data)
-        print('Data successfully imported.')
-        return SUCCESS
-    else:
-        print('Nothing to import.')
-        return FAILURE
+        if data:
+            client.import_data(data)
+            console.print(f'[b green]{SUCCESS_LOGO}[/] Data successfully imported.')
+            return SUCCESS
+        else:
+            console.print('Nothing to import.')
+            return FAILURE
 
 
+# TODO: check this
 @exception_handler
 def export_data(args):
     """
@@ -1312,18 +1655,17 @@ def export_data(args):
     """
     client = get_client(args)
     destination_file_path = args.file_path
-    print('Start querying data.')
-    data = client.export_data()
-    try:
-        with open(destination_file_path, 'w+') as destination_file:
-            destination_file.write(render_json(**data))
-            print('File successfully written.')
-        print('Data successfully exported to %s' % args.file_path)
-        return SUCCESS
-    except OSError as error:
-        print('There was a problem with reading your file.')
-        print(error)
-        return FAILURE
+    with console.status('Querying data...'):
+        data = client.export_data()
+        try:
+            with open(destination_file_path, 'w+') as destination_file:
+                destination_file.write(render_json(**data))
+            console.print(f'[b green]{SUCCESS_LOGO}[/] Data successfully exported to {args.file_path}')
+            return SUCCESS
+        except OSError as error:
+            console.print(f'[b red]{FAILURE_LOGO}[/] There was a problem with reading your file.')
+            logger.error(error)
+            return FAILURE
 
 
 @exception_handler
@@ -1342,7 +1684,7 @@ def set_tombstone(args):
         scope, name = get_scope(did, client)
         replicas.append({'scope': scope, 'name': name, 'rse': rse})
     client.set_tombstone(replicas)
-    logger.info('Set tombstone successfully on: %s' % args.dids)
+    print('Set tombstone successfully on: %s' % args.dids)
     return SUCCESS
 
 
@@ -1366,6 +1708,7 @@ def get_parser():
     oparser.add_argument('-S', '--auth-strategy', dest="auth_strategy", default=None, help="Authentication strategy (userpass, x509, ssh ...)")
     oparser.add_argument('-T', '--timeout', dest="timeout", type=float, default=None, help="Set all timeout values to SECONDS")
     oparser.add_argument('--vo', dest="vo", metavar="VO", default=None, help="VO to authenticate at. Only used in multi-VO mode.")
+    oparser.add_argument('--paginate', '-p', default=False, action='store_true', help="Paginate the output.")
 
     # Options for the userpass auth_strategy
     oparser.add_argument('-u', '--user', dest='username', default=None, help='username')
@@ -2434,8 +2777,9 @@ if __name__ == '__main__':
                 'delete_limit_rse': delete_limit_rse,
                 }
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
+    logger = setup_rich_logger(module_name=__name__, logger_name='user', verbose=args.verbose, console=console)
+    # if args.verbose:
+    #     logger.setLevel(logging.DEBUG)
     start_time = time.time()
     command = commands.get(args.which)
     result = command(args)
